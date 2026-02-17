@@ -145,6 +145,45 @@ def discover_skills() -> list[dict]:
 
 _skills: list[dict] = discover_skills()
 
+# ---------------------------------------------------------------------------
+# Skill group mapping — plugin name → (emoji, display label)
+# ---------------------------------------------------------------------------
+
+SKILL_GROUPS: dict[str, tuple[str, str]] = {
+    "superpowers":          ("💥", "Superpowers"),
+    "Notion":               ("📓", "Notion"),
+    "atlassian":            ("🏢", "Atlassian"),
+    "frontend-design":      ("🎨", "Frontend"),
+    "feature-dev":          ("🔧", "Feature Dev"),
+    "code-review":          ("🔍", "Code Review"),
+    "pr-review-toolkit":    ("📋", "PR Review"),
+    "claude-md-management": ("📝", "Project Docs"),
+    "code-simplifier":      ("✨", "Simplifier"),
+}
+
+
+def _group_label(plugin: str) -> str:
+    """Return 'emoji Name' for a plugin, with fallback for unknown plugins."""
+    if plugin in SKILL_GROUPS:
+        emoji, name = SKILL_GROUPS[plugin]
+        return f"{emoji} {name}"
+    return f"🔌 {plugin.replace('-', ' ').title()}"
+
+
+def _group_emoji(plugin: str) -> str:
+    """Return just the emoji for a plugin."""
+    if plugin in SKILL_GROUPS:
+        return SKILL_GROUPS[plugin][0]
+    return "🔌"
+
+
+def _skills_by_group() -> dict[str, list[dict]]:
+    """Group discovered skills by plugin name."""
+    groups: dict[str, list[dict]] = {}
+    for sk in _skills:
+        groups.setdefault(sk["plugin"], []).append(sk)
+    return groups
+
 
 # ---------------------------------------------------------------------------
 # Owner persistence (first /start wins)
