@@ -94,7 +94,40 @@ def discover_skills() -> list[dict]:
         install_path = Path(versions[-1]["installPath"])
         plugin_name = plugin_key.split("@")[0]
 
+        # Pattern 1: skills/*/SKILL.md (superpowers, claude-md-management)
         for skill_md in sorted(install_path.rglob("skills/*/SKILL.md")):
+            skill_name = skill_md.parent.name
+            # Skip if nested deeper (e.g. skills/notion/subskill/SKILL.md handled below)
+            if skill_md.parent.parent.name != "skills":
+                continue
+            if skill_name in seen:
+                continue
+            seen.add(skill_name)
+            skills.append({
+                "name": skill_name,
+                "plugin": plugin_name,
+                "slash": f"/{skill_name}",
+            })
+
+        # Pattern 2: commands/*.md and commands/*/*.md (code-review, Notion, pr-review-toolkit)
+        commands_dir = install_path / "commands"
+        if commands_dir.is_dir():
+            for cmd_md in sorted(commands_dir.rglob("*.md")):
+                # Derive skill name from path: commands/foo.md -> foo, commands/tasks/build.md -> tasks:build
+                rel = cmd_md.relative_to(commands_dir)
+                parts = list(rel.with_suffix("").parts)
+                skill_name = ":".join(parts)  # e.g. "find", "tasks:build"
+                if skill_name in seen:
+                    continue
+                seen.add(skill_name)
+                skills.append({
+                    "name": skill_name,
+                    "plugin": plugin_name,
+                    "slash": f"/{skill_name}",
+                })
+
+        # Pattern 3: skills/*/*/SKILL.md (Notion deep skills like skills/notion/knowledge-capture/)
+        for skill_md in sorted(install_path.rglob("skills/*/*/SKILL.md")):
             skill_name = skill_md.parent.name
             if skill_name in seen:
                 continue
