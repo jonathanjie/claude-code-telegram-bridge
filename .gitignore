@@ -1,0 +1,15 @@
+# Secrets & per-deployment state
+.env
+owner.json
+sessions.json
+recents.json
+settings.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code Telegram Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=jons-openclaw
+WorkingDirectory=/home/jons-openclaw/claude-telegram
+ExecStart=/home/jons-openclaw/claude-telegram/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/home/jons-openclaw/.local/bin:/home/jons-openclaw/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target
