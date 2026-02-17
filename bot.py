@@ -643,10 +643,7 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     session = _get_session(chat_id)
 
-    # Clear any pending skill when navigating menus
-    if data not in ("cancel",) and not data.startswith("sk:"):
-        session.pending_skill = None
-
+    # Allow navigation and settings even if session is busy
     # --- Navigation ---
     if data == "menu" or data == "back":
         await query.edit_message_text(MENU_TEXT, reply_markup=_kb_main_menu(chat_id))
@@ -684,6 +681,68 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     if data == "cat:session":
         await query.edit_message_text("📋 *Session*", parse_mode="Markdown", reply_markup=_kb_session())
+        return
+
+    # --- Settings ---
+    if data == "set:model":
+        await query.edit_message_text("⚙ *Select model:*", parse_mode="Markdown", reply_markup=_kb_model_picker())
+        return
+
+    if data.startswith("set:model:"):
+        choice = data[len("set:model:"):]
+        if choice == "default":
+            _settings.pop("model", None)
+        else:
+            _settings["model"] = MODEL_ALIASES.get(choice, choice)
+        _save_settings()
+        await query.edit_message_text(
+            f"⚙ Model set to *{choice}*",
+            parse_mode="Markdown",
+            reply_markup=_kb_settings(),
+        )
+        return
+
+    if data == "set:sudo":
+        if _settings.get("skip_permissions") == "1":
+            _settings["skip_permissions"] = "0"
+        else:
+            _settings["skip_permissions"] = "1"
+        _save_settings()
+        state = "ON" if _settings.get("skip_permissions") == "1" else "OFF"
+        await query.edit_message_text(
+            f"⚙ Sudo is now *{state}*",
+            parse_mode="Markdown",
+            reply_markup=_kb_settings(),
+        )
+        return
+
+    # --- Session Info (safe to view while busy) ---
+    if data == "ses:info":
+        s = _get_session(chat_id)
+        if not s.session_id:
+            await query.edit_message_text("No active session. Send a message to start one.", reply_markup=_kb_main_menu(chat_id))
+            return
+        model = _settings.get("model", "default")
+        sudo = "enabled" if _settings.get("skip_permissions") == "1" else "disabled"
+        await query.edit_message_text(
+            f"📋 *Session Info*\n"
+            f"ID: `{s.session_id}`\n"
+            f"Started: {s.created_at}\n"
+            f"Messages: {s.message_count}\n"
+            f"Model: {model}\n"
+            f"Sudo: {sudo}",
+            parse_mode="Markdown",
+            reply_markup=_kb_main_menu(chat_id),
+        )
+        return
+
+    # Clear any pending skill when navigating menus
+    if data not in ("cancel",) and not data.startswith("sk:"):
+        session.pending_skill = None
+
+    # Block destructive/relay actions if busy
+    if session.busy:
+        await update.effective_chat.send_message("Claude Code is still working on the previous request. Please wait.")
         return
 
     # --- Skill activation ---
@@ -733,25 +792,6 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     # --- Session commands ---
     if data.startswith("ses:"):
         action = data[4:]
-        if action == "info":
-            s = _get_session(chat_id)
-            if not s.session_id:
-                await query.edit_message_text("No active session. Send a message to start one.", reply_markup=_kb_main_menu(chat_id))
-                return
-            model = _settings.get("model", "default")
-            sudo = "enabled" if _settings.get("skip_permissions") == "1" else "disabled"
-            await query.edit_message_text(
-                f"📋 *Session Info*\n"
-                f"ID: `{s.session_id}`\n"
-                f"Started: {s.created_at}\n"
-                f"Messages: {s.message_count}\n"
-                f"Model: {model}\n"
-                f"Sudo: {sudo}",
-                parse_mode="Markdown",
-                reply_markup=_kb_main_menu(chat_id),
-            )
-            return
-
         if action == "new":
             old = _get_session(chat_id).session_id
             _sessions[chat_id] = Session()
@@ -804,39 +844,6 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
             _save_sessions()
             await query.edit_message_text("🗑 Session cleared.", reply_markup=_kb_main_menu(chat_id))
             return
-
-    # --- Settings ---
-    if data == "set:model":
-        await query.edit_message_text("⚙ *Select model:*", parse_mode="Markdown", reply_markup=_kb_model_picker())
-        return
-
-    if data.startswith("set:model:"):
-        choice = data[len("set:model:"):]
-        if choice == "default":
-            _settings.pop("model", None)
-        else:
-            _settings["model"] = MODEL_ALIASES.get(choice, choice)
-        _save_settings()
-        await query.edit_message_text(
-            f"⚙ Model set to *{choice}*",
-            parse_mode="Markdown",
-            reply_markup=_kb_settings(),
-        )
-        return
-
-    if data == "set:sudo":
-        if _settings.get("skip_permissions") == "1":
-            _settings["skip_permissions"] = "0"
-        else:
-            _settings["skip_permissions"] = "1"
-        _save_settings()
-        state = "ON" if _settings.get("skip_permissions") == "1" else "OFF"
-        await query.edit_message_text(
-            f"⚙ Sudo is now *{state}*",
-            parse_mode="Markdown",
-            reply_markup=_kb_settings(),
-        )
-        return
 
 
 async def _relay_from_callback(update: Update, prompt: str, *, new_session: bool = False) -> None:
