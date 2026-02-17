@@ -461,17 +461,38 @@ def _kb_main_menu(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _kb_skills() -> InlineKeyboardMarkup:
+def _kb_skill_groups() -> InlineKeyboardMarkup:
+    """Layer 2: show plugin groups as buttons."""
+    groups = _skills_by_group()
     rows: list[list[InlineKeyboardButton]] = []
     pair: list[InlineKeyboardButton] = []
-    for sk in _skills:
-        pair.append(_btn(sk["name"], f"sk:{sk['name']}"))
+    for plugin in sorted(groups, key=lambda p: _group_label(p)):
+        emoji = _group_emoji(plugin)
+        label = f"{emoji} {plugin.replace('-', ' ').title()}" if plugin not in SKILL_GROUPS else _group_label(plugin)
+        pair.append(_btn(label, f"sg:{plugin}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
     rows.append([_btn("« Back", "back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_skill_group(plugin: str) -> InlineKeyboardMarkup:
+    """Layer 3: show individual skills within a plugin group."""
+    groups = _skills_by_group()
+    skills = groups.get(plugin, [])
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for sk in skills:
+        pair.append(_btn(sk["name"], f"sk:{sk['name']}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([_btn("« Back", "cat:skills")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -641,7 +662,16 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     # --- Categories ---
     if data == "cat:skills":
-        await query.edit_message_text("🛠 *Skills*\nTap to activate, then type your message.", parse_mode="Markdown", reply_markup=_kb_skills())
+        await query.edit_message_text("🛠 *Skills*\nChoose a category.", parse_mode="Markdown", reply_markup=_kb_skill_groups())
+        return
+
+    if data.startswith("sg:"):
+        plugin = data[3:]
+        label = _group_label(plugin)
+        await query.edit_message_text(
+            f"{label}\nTap to activate, then type your message.",
+            reply_markup=_kb_skill_group(plugin),
+        )
         return
 
     if data == "cat:git":
