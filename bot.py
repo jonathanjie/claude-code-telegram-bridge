@@ -2,10 +2,13 @@
 """Claude Code Telegram Bridge — control Claude Code from your phone."""
 
 import os
+import sys
 import json
 import asyncio
+import fcntl
 import logging
 import shutil
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -43,6 +46,7 @@ SESSION_FILE = BOT_DIR / "sessions.json"
 SETTINGS_FILE = BOT_DIR / "settings.json"
 RECENTS_FILE = BOT_DIR / "recents.json"
 COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "300"))  # seconds
+STALE_TIMEOUT = int(os.environ.get("STALE_TIMEOUT", "60"))  # kill subprocess if 0 CPU for this long
 MAX_MSG_LEN = 4096
 
 MODEL_ALIASES = {
@@ -66,6 +70,28 @@ def _claude_env() -> dict[str, str]:
     for key in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
         env.pop(key, None)
     return env
+
+# ---------------------------------------------------------------------------
+# Instance lock — prevent dual-instance Telegram Conflict errors
+# ---------------------------------------------------------------------------
+
+_lock_fd = None
+
+
+def _acquire_lock() -> None:
+    """Acquire an exclusive file lock so only one bot instance can run."""
+    global _lock_fd
+    lock_path = BOT_DIR / "bot.lock"
+    _lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.error("Another instance is already running (lock: %s)", lock_path)
+        sys.exit(1)
+    _lock_fd.write(str(os.getpid()))
+    _lock_fd.flush()
+    logger.info("Acquired instance lock (pid=%d)", os.getpid())
+
 
 # ---------------------------------------------------------------------------
 # Skill discovery — scan installed Claude Code plugins for user-invocable skills
@@ -323,6 +349,44 @@ def _get_session(chat_id: int) -> Session:
 # ---------------------------------------------------------------------------
 
 
+def _proc_cpu_ticks(pid: int) -> int | None:
+    """Read total CPU ticks (utime+stime) from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            parts = f.read().split()
+            return int(parts[13]) + int(parts[14])
+    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+        return None
+
+
+async def _cpu_watchdog(proc: asyncio.subprocess.Process, stale_limit: int) -> None:
+    """Kill subprocess if it shows zero CPU activity for stale_limit seconds."""
+    pid = proc.pid
+    last_cpu = _proc_cpu_ticks(pid) or 0
+    stale_since: float | None = None
+
+    while proc.returncode is None:
+        await asyncio.sleep(10)
+        cpu = _proc_cpu_ticks(pid)
+        if cpu is None:
+            return  # process already gone
+        if cpu == last_cpu:
+            if stale_since is None:
+                stale_since = time.monotonic()
+            elif time.monotonic() - stale_since > stale_limit:
+                logger.warning(
+                    "PID %d stale for %ds (0 CPU ticks), killing", pid, stale_limit
+                )
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                return
+        else:
+            stale_since = None
+            last_cpu = cpu
+
+
 async def run_claude(
     prompt: str,
     session_id: str | None = None,
@@ -353,6 +417,8 @@ async def run_claude(
         env=_claude_env(),
     )
 
+    watchdog = asyncio.create_task(_cpu_watchdog(proc, STALE_TIMEOUT))
+
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -362,6 +428,8 @@ async def run_claude(
             "result": f"Timed out after {timeout}s",
             "session_id": session_id,
         }
+    finally:
+        watchdog.cancel()
 
     raw = stdout.decode()
 
@@ -635,6 +703,30 @@ async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> N
 MENU_TEXT = "Claude Code Bridge — tap a button or type a message."
 
 
+async def _nav_reply(
+    query,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    session: Session,
+    *,
+    parse_mode: str | None = None,
+) -> None:
+    """Send a navigation response — edit if idle, new message if busy.
+
+    When Claude is processing, the original menu message may have been
+    replaced by a status update. Sending a new message lets the user
+    browse freely while waiting for the response.
+    """
+    if session.busy:
+        await query.message.chat.send_message(
+            text, reply_markup=reply_markup, parse_mode=parse_mode,
+        )
+    else:
+        await query.edit_message_text(
+            text, reply_markup=reply_markup, parse_mode=parse_mode,
+        )
+
+
 @_auth_callback
 async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -644,9 +736,9 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     session = _get_session(chat_id)
 
     # Allow navigation and settings even if session is busy
-    # --- Navigation ---
+    # --- Navigation (all use _nav_reply for busy-aware responses) ---
     if data == "menu" or data == "back":
-        await query.edit_message_text(MENU_TEXT, reply_markup=_kb_main_menu(chat_id))
+        await _nav_reply(query, MENU_TEXT, _kb_main_menu(chat_id), session)
         return
 
     if data == "noop":
@@ -654,38 +746,40 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     if data == "cancel":
         session.pending_skill = None
-        await query.edit_message_text(MENU_TEXT, reply_markup=_kb_main_menu(chat_id))
+        await _nav_reply(query, MENU_TEXT, _kb_main_menu(chat_id), session)
         return
 
     # --- Categories ---
     if data == "cat:skills":
-        await query.edit_message_text("🛠 *Skills*\nChoose a category.", parse_mode="Markdown", reply_markup=_kb_skill_groups())
+        await _nav_reply(query, "🛠 *Skills*\nChoose a category.", _kb_skill_groups(), session, parse_mode="Markdown")
         return
 
     if data.startswith("sg:"):
         plugin = data[3:]
         label = _group_label(plugin)
-        await query.edit_message_text(
+        await _nav_reply(
+            query,
             f"{label}\nTap to activate, then type your message.",
-            reply_markup=_kb_skill_group(plugin),
+            _kb_skill_group(plugin),
+            session,
         )
         return
 
     if data == "cat:git":
-        await query.edit_message_text("📂 *Git*", parse_mode="Markdown", reply_markup=_kb_git())
+        await _nav_reply(query, "📂 *Git*", _kb_git(), session, parse_mode="Markdown")
         return
 
     if data == "cat:settings":
-        await query.edit_message_text("⚙ *Settings*", parse_mode="Markdown", reply_markup=_kb_settings())
+        await _nav_reply(query, "⚙ *Settings*", _kb_settings(), session, parse_mode="Markdown")
         return
 
     if data == "cat:session":
-        await query.edit_message_text("📋 *Session*", parse_mode="Markdown", reply_markup=_kb_session())
+        await _nav_reply(query, "📋 *Session*", _kb_session(), session, parse_mode="Markdown")
         return
 
     # --- Settings ---
     if data == "set:model":
-        await query.edit_message_text("⚙ *Select model:*", parse_mode="Markdown", reply_markup=_kb_model_picker())
+        await _nav_reply(query, "⚙ *Select model:*", _kb_model_picker(), session, parse_mode="Markdown")
         return
 
     if data.startswith("set:model:"):
@@ -695,10 +789,12 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         else:
             _settings["model"] = MODEL_ALIASES.get(choice, choice)
         _save_settings()
-        await query.edit_message_text(
+        await _nav_reply(
+            query,
             f"⚙ Model set to *{choice}*",
+            _kb_settings(),
+            session,
             parse_mode="Markdown",
-            reply_markup=_kb_settings(),
         )
         return
 
@@ -709,10 +805,12 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
             _settings["skip_permissions"] = "1"
         _save_settings()
         state = "ON" if _settings.get("skip_permissions") == "1" else "OFF"
-        await query.edit_message_text(
+        await _nav_reply(
+            query,
             f"⚙ Sudo is now *{state}*",
+            _kb_settings(),
+            session,
             parse_mode="Markdown",
-            reply_markup=_kb_settings(),
         )
         return
 
@@ -720,40 +818,44 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
     if data == "ses:info":
         s = _get_session(chat_id)
         if not s.session_id:
-            await query.edit_message_text("No active session. Send a message to start one.", reply_markup=_kb_main_menu(chat_id))
+            await _nav_reply(query, "No active session. Send a message to start one.", _kb_main_menu(chat_id), session)
             return
         model = _settings.get("model", "default")
         sudo = "enabled" if _settings.get("skip_permissions") == "1" else "disabled"
-        await query.edit_message_text(
+        await _nav_reply(
+            query,
             f"📋 *Session Info*\n"
             f"ID: `{s.session_id}`\n"
             f"Started: {s.created_at}\n"
             f"Messages: {s.message_count}\n"
             f"Model: {model}\n"
             f"Sudo: {sudo}",
+            _kb_main_menu(chat_id),
+            session,
             parse_mode="Markdown",
-            reply_markup=_kb_main_menu(chat_id),
         )
         return
 
     # Clear any pending skill when navigating menus
-    if data not in ("cancel",) and not data.startswith("sk:"):
+    if data not in ("cancel",) and not data.startswith("sk:") and not data.startswith("sg:"):
         session.pending_skill = None
+
+    # --- Skill activation (nonblocking — just sets pending state) ---
+    if data.startswith("sk:"):
+        skill_name = data[3:]
+        session.pending_skill = skill_name
+        await _nav_reply(
+            query,
+            f"🛠 *{skill_name}*\nType your message (it will be sent as `/{skill_name} <your text>`).",
+            _kb_cancel(),
+            session,
+            parse_mode="Markdown",
+        )
+        return
 
     # Block destructive/relay actions if busy
     if session.busy:
         await update.effective_chat.send_message("Claude Code is still working on the previous request. Please wait.")
-        return
-
-    # --- Skill activation ---
-    if data.startswith("sk:"):
-        skill_name = data[3:]
-        session.pending_skill = skill_name
-        await query.edit_message_text(
-            f"🛠 *{skill_name}*\nType your message (it will be sent as `/{skill_name} <your text>`).",
-            parse_mode="Markdown",
-            reply_markup=_kb_cancel(),
-        )
         return
 
     # --- Git commands ---
@@ -782,10 +884,12 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         if action in prompts:
             label, tag = prompts[action]
             session.pending_skill = tag  # reuse pending_skill for git too
-            await query.edit_message_text(
+            await _nav_reply(
+                query,
                 f"📂 *git {action}*\n{label}",
+                _kb_cancel(),
+                session,
                 parse_mode="Markdown",
-                reply_markup=_kb_cancel(),
             )
             return
 
@@ -799,7 +903,7 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
             msg = "🆕 New session started."
             if old:
                 msg += f"\nPrevious: `{old[:16]}...`"
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=_kb_main_menu(chat_id))
+            await _nav_reply(query, msg, _kb_main_menu(chat_id), session, parse_mode="Markdown")
             return
 
         if action == "compact":
@@ -842,7 +946,7 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         if action == "clear":
             _sessions.pop(chat_id, None)
             _save_sessions()
-            await query.edit_message_text("🗑 Session cleared.", reply_markup=_kb_main_menu(chat_id))
+            await _nav_reply(query, "🗑 Session cleared.", _kb_main_menu(chat_id), session)
             return
 
 
@@ -918,6 +1022,7 @@ HELP_TEXT = (
     "/read <path> — Read file\n"
     "/edit <instr> — Edit via instruction\n"
     "/run <cmd> — Run a shell command\n"
+    "/restart — Syntax-check & restart bot\n"
     "/help — This message"
 )
 
@@ -1174,6 +1279,39 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Self-update / restart ---
+
+
+@_auth
+async def cmd_restart(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Syntax-check bot.py then restart via systemd."""
+    await update.message.reply_text("Checking syntax...")
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "py_compile", str(BOT_DIR / "bot.py"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr_out = await proc.communicate()
+
+    if proc.returncode != 0:
+        err = stderr_out.decode().strip()
+        await update.message.reply_text(
+            f"Syntax error — restart aborted:\n```\n{err}\n```",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text("Syntax OK. Restarting in 2s...")
+    await asyncio.sleep(2)
+
+    # Detached systemd restart — survives our own death.
+    # Uses arg-list form (no shell) — safe, no user input involved.
+    await asyncio.create_subprocess_exec(
+        "systemctl", "--user", "restart", "claude-telegram",
+    )
+
+
 # --- Regular messages ---
 
 
@@ -1225,6 +1363,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("diff", "Git diff"),
             BotCommand("commit", "Commit changes"),
             BotCommand("run", "Run shell command"),
+            BotCommand("restart", "Syntax-check & restart bot"),
             BotCommand("help", "Show help"),
         ]
     )
@@ -1232,6 +1371,8 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
+    _acquire_lock()
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -1262,6 +1403,7 @@ def main() -> None:
         CommandHandler("read", cmd_read),
         CommandHandler("edit", cmd_edit),
         CommandHandler("run", cmd_run),
+        CommandHandler("restart", cmd_restart),
         CallbackQueryHandler(handle_callback),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
     ]

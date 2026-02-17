@@ -15,37 +15,52 @@ python bot.py
 
 ## Architecture
 
-**Single-file design** — everything lives in `bot.py` (~1170 lines). This is intentional; the bot is simple enough that splitting into modules would add indirection without value.
+**Single-file design** — everything lives in `bot.py` (~1400 lines). This is intentional; the bot is simple enough that splitting into modules would add indirection without value.
 
 ### Key Sections in bot.py
 
 1. **Config** (lines 1-60) — .env loading, constants, model aliases
-2. **Skill discovery** (lines 70-115) — scans `~/.claude/plugins/` for user-invocable skills at startup
-3. **Persistence** (lines 115-245) — owner lock, settings, recents, sessions — all JSON file-backed
-4. **Claude runner** (lines 250-305) — `run_claude()` — async subprocess exec, JSON output parsing, timeout handling
-5. **Helpers** (lines 305-355) — message splitting, result formatting, typing indicator
-6. **Keyboards** (lines 370-455) — inline button builders for the 2-level menu system
-7. **Auth** (lines 458-485) — decorators for command and callback handlers
-8. **Core relay** (lines 490-780) — `_relay()` and `_relay_from_callback()` — send prompt to Claude, return result
-9. **Callback handler** (lines 540-740) — button tap state machine
-10. **Commands** (lines 785-1065) — slash command handlers
-11. **Message handler** (lines 1070-1100) — plain text with pending-skill prefix support
-12. **Entrypoint** (lines 1105-1168) — handler registration, polling startup
+2. **Instance lock** (lines 71-93) — `_acquire_lock()` — `fcntl.flock` PID guard prevents dual instances
+3. **Skill discovery** (lines 95-170) — scans `~/.claude/plugins/` for user-invocable skills at startup (3 patterns)
+4. **Skill groups** (lines 175-215) — `SKILL_GROUPS` constant + `_group_label()`, `_skills_by_group()` helpers
+5. **Persistence** (lines 220-350) — owner lock, settings, recents, sessions — all JSON file-backed
+6. **CPU watchdog** (lines 352-390) — `_cpu_watchdog()` — kills stale subprocesses with 0 CPU activity
+7. **Claude runner** (lines 392-440) — `run_claude()` — async subprocess exec, JSON output parsing, timeout + watchdog
+8. **Helpers** (lines 442-500) — message splitting, result formatting, typing indicator
+9. **Keyboards** (lines 502-610) — inline button builders for the 3-layer drill-down menu (Main Menu → Plugin Groups → Skills)
+10. **Auth** (lines 612-640) — decorators for command and callback handlers
+11. **Core relay** (lines 642-700) — `_relay()` and `_relay_from_callback()`
+12. **Nav helper** (lines 703-730) — `_nav_reply()` — busy-aware response (edit if idle, new message if busy)
+13. **Callback handler** (lines 730-950) — button tap state machine
+14. **Commands** (lines 960-1310) — slash command handlers including `/restart`
+15. **Message handler** (lines 1320-1350) — plain text with pending-skill prefix support
+16. **Entrypoint** (lines 1360-1415) — `_acquire_lock()`, handler registration, polling startup
 
 ### Data Flow
 
 ```
 Telegram message → auth check → pending_skill prefix? → _relay() → run_claude() → format → reply
-Button tap → auth check → callback handler → navigate / set state / _relay_from_callback()
+Button tap → auth check → callback handler → _nav_reply() / _relay_from_callback()
 ```
+
+### Self-Update via Telegram
+
+The bot can update its own code through Claude Code:
+
+1. Send a message like "Add feature X to bot.py" → Claude edits `bot.py`
+2. Review the response showing changes
+3. Send `/restart` → bot syntax-checks → systemd restart with new code
+
+Safety: `/restart` runs `py_compile` before restarting. `Restart=always` in systemd recovers from runtime crashes.
 
 ### State Files (gitignored)
 
-- `.env` — secrets (TELEGRAM_TOKEN, CLAUDE_WORK_DIR)
+- `.env` — secrets (TELEGRAM_TOKEN, CLAUDE_WORK_DIR, optional: CLAUDE_BIN, COMMAND_TIMEOUT, STALE_TIMEOUT)
 - `owner.json` — `{"owner_id": <telegram_user_id>}` — first /start wins
 - `sessions.json` — `{chat_id: {session_id, created_at, message_count}}`
 - `settings.json` — `{model: "...", skip_permissions: "0"|"1"}`
 - `recents.json` — `{chat_id: ["skill1", "skill2", ...]}` — max 5 per user
+- `bot.lock` — `fcntl.flock` instance guard (PID inside)
 
 ## Conventions
 
@@ -56,7 +71,7 @@ Button tap → auth check → callback handler → navigate / set state / _relay
 - **Auth decorators** — `@_auth` for commands, `@_auth_callback` for button handlers
 - **Underscore-prefixed private functions** — `_relay()`, `_split_message()`, `_btn()`, etc.
 - **Inline keyboard builders** — `_kb_*()` functions return `InlineKeyboardMarkup`
-- **Callback data format** — `prefix:action[:arg]`, max 64 bytes
+- **Callback data format** — `prefix:action[:arg]`, max 64 bytes. Prefixes: `cat:` (category), `sk:` (invoke skill), `sg:` (skill group drilldown), `set:` (settings), `ses:` (session ops)
 
 ### Error Handling
 
@@ -64,6 +79,8 @@ Button tap → auth check → callback handler → navigate / set state / _relay
 - Stale session IDs trigger automatic retry without `--resume`
 - Markdown parse failures in Telegram fall back to plain text
 - Timeout kills the subprocess and returns a timeout message
+- CPU watchdog kills subprocesses with 0 CPU for `STALE_TIMEOUT` seconds (default 60)
+- Instance lock prevents dual-instance Telegram Conflict errors
 
 ### Adding a New Command
 
@@ -77,6 +94,7 @@ Button tap → auth check → callback handler → navigate / set state / _relay
 1. Add a category button in `_kb_main_menu()`
 2. Create a `_kb_<category>()` builder
 3. Add `cat:<category>` handling in `handle_callback()`
+4. Use `_nav_reply()` instead of `query.edit_message_text()` for busy-aware navigation
 
 ## Service Management
 
@@ -86,15 +104,16 @@ systemctl --user status claude-telegram     # check status
 journalctl --user -u claude-telegram -f     # live logs
 ```
 
-**Warning:** If Claude Code is running via this bot, restarting the service will kill the active Claude session. The bot auto-restarts via `Restart=on-failure`.
+The bot uses `Restart=always` and an `fcntl.flock` PID lock. If a second instance tries to start, it exits immediately. Systemd will always restart the bot after any exit.
 
 ## Testing
 
 No test suite currently. To verify changes:
 
-1. `python -c "import bot"` — syntax/import check
-2. Restart the service and test via Telegram
-3. Check logs: `journalctl --user -u claude-telegram -f`
+1. `python -m py_compile bot.py` — syntax check
+2. `python -c "from bot import _acquire_lock; _acquire_lock()"` — verify lock (fails if instance running = good)
+3. `/restart` via Telegram — syntax-checks and restarts with new code
+4. Check logs: `journalctl --user -u claude-telegram -f`
 
 ## Known Limitations
 
@@ -103,3 +122,4 @@ No test suite currently. To verify changes:
 - No file/image upload support
 - Telegram's 4096-char message limit requires chunking long responses
 - Markdown formatting can fail on Claude's output (falls back to plain text)
+- CPU watchdog reads `/proc/<pid>/stat` — Linux only

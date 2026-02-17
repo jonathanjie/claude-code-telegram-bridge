@@ -4,6 +4,8 @@ owner.json
 sessions.json
 recents.json
 settings.json
+bot.lock
+bot.log
 
 # Python
 __pycache__/
