@@ -49,6 +49,11 @@ COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "900"))  # seconds
 STALE_TIMEOUT = int(os.environ.get("STALE_TIMEOUT", "60"))  # kill subprocess if 0 CPU for this long
 MAX_MSG_LEN = 4096
 
+# Claude Code session files — derive path from WORK_DIR
+_CC_SESSIONS_DIR = (
+    Path.home() / ".claude" / "projects" / WORK_DIR.replace("/", "-")
+)
+
 MODEL_ALIASES = {
     "opus": "claude-opus-4-6",
     "sonnet": "claude-sonnet-4-5-20250929",
@@ -345,6 +350,64 @@ def _get_session(chat_id: int) -> Session:
 
 
 # ---------------------------------------------------------------------------
+# Claude Code session history — scan on-disk JSONL files
+# ---------------------------------------------------------------------------
+
+
+def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]:
+    """Scan Claude Code session files and return recent sessions with metadata.
+
+    Reads the first user message from each JSONL (what you originally typed)
+    so sessions are recognizable. Returns (sessions, total_count).
+    """
+    if not _CC_SESSIONS_DIR.is_dir():
+        return [], 0
+
+    all_files = sorted(
+        _CC_SESSIONS_DIR.glob("*.jsonl"),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    total = len(all_files)
+    session_files = all_files[offset:offset + limit]
+
+    results: list[dict] = []
+    for f in session_files:
+        sid = f.stem
+        st = f.stat()
+        mtime = datetime.fromtimestamp(st.st_mtime)
+
+        # Read first user message (the original prompt)
+        prompt = ""
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    entry = json.loads(line)
+                    if entry.get("type") == "user":
+                        msg = entry.get("message", {})
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            # Content can be a list of blocks
+                            content = " ".join(
+                                b.get("text", "") for b in content
+                                if isinstance(b, dict)
+                            )
+                        prompt = content.strip()
+                        break
+        except (json.JSONDecodeError, IOError):
+            pass
+
+        results.append({
+            "session_id": sid,
+            "prompt": prompt[:60] or sid[:12],
+            "mtime": mtime,
+            "size_kb": st.st_size / 1024,
+        })
+
+    return results, total
+
+
+# ---------------------------------------------------------------------------
 # Claude Code runner
 # ---------------------------------------------------------------------------
 
@@ -605,9 +668,41 @@ def _kb_model_picker() -> InlineKeyboardMarkup:
 def _kb_session() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [_btn("📊 Info", "ses:info"), _btn("🆕 New", "ses:new")],
-        [_btn("📦 Compact", "ses:compact"), _btn("🗑 Clear", "ses:clear")],
+        [_btn("📜 History", "ses:history"), _btn("📦 Compact", "ses:compact")],
+        [_btn("🗑 Clear", "ses:clear")],
         [_btn("« Back", "back")],
     ])
+
+
+def _kb_session_history(
+    sessions: list[dict],
+    current_sid: str | None = None,
+    offset: int = 0,
+    total: int = 0,
+    page_size: int = 5,
+) -> InlineKeyboardMarkup:
+    """Show recent Claude Code sessions as resumable buttons with pagination."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in sessions:
+        prompt = s["prompt"]
+        if len(prompt) > 40:
+            prompt = prompt[:37] + "..."
+        date = s["mtime"].strftime("%m/%d %H:%M")
+        active = " ●" if s["session_id"] == current_sid else ""
+        label = f"{prompt} ({date}){active}"
+        rows.append([_btn(label, f"sr:{s['session_id']}")])
+
+    # Pagination row
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(_btn("◀ Prev", f"sh:{offset - page_size}"))
+    if offset + page_size < total:
+        nav.append(_btn("Next ▶", f"sh:{offset + page_size}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([_btn("« Back", "cat:session")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _kb_cancel() -> InlineKeyboardMarkup:
@@ -837,6 +932,46 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    # --- Session history & resume ---
+    if data == "ses:history" or data.startswith("sh:"):
+        page_size = 5
+        offset = 0
+        if data.startswith("sh:"):
+            offset = max(0, int(data[3:]))
+        sessions_list, total = _scan_cc_sessions(limit=page_size, offset=offset)
+        if not sessions_list:
+            await _nav_reply(query, "No sessions found.", _kb_session(), session)
+            return
+        await _nav_reply(
+            query,
+            f"📜 *Session History* ({total} total)\nTap to resume:",
+            _kb_session_history(sessions_list, session.session_id, offset, total, page_size),
+            session,
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("sr:"):
+        target_sid = data[3:]
+        session.session_id = target_sid
+        session.created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        session.message_count = 0
+        _save_sessions()
+        # Find the prompt for display
+        prompt_text = target_sid[:16]
+        for s in _scan_cc_sessions(limit=20)[0]:
+            if s["session_id"] == target_sid:
+                prompt_text = s["prompt"]
+                break
+        await _nav_reply(
+            query,
+            f"📜 Resumed session:\n_{prompt_text}_\n`{target_sid[:16]}...`",
+            _kb_main_menu(chat_id),
+            session,
+            parse_mode="Markdown",
+        )
+        return
+
     # Clear any pending skill when navigating menus
     if data not in ("cancel",) and not data.startswith("sk:") and not data.startswith("sg:"):
         session.pending_skill = None
@@ -1024,6 +1159,7 @@ HELP_TEXT = (
     "/edit <instr> — Edit via instruction\n"
     "/run <cmd> — Run a shell command\n"
     "/restart — Syntax-check & restart bot\n"
+    "/sessions — Browse session history\n"
     "/help — This message"
 )
 
@@ -1072,6 +1208,24 @@ async def cmd_session(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         f"Messages: {s.message_count}\n"
         f"Model: {model}\n"
         f"Sudo (skip-permissions): {sudo}"
+    )
+
+
+@_auth
+async def cmd_sessions(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    """Browse Claude Code session history with pagination buttons."""
+    page_size = 5
+    sessions_list, total = _scan_cc_sessions(limit=page_size, offset=0)
+    if not sessions_list:
+        await update.message.reply_text("No session history found.")
+        return
+    session = _get_session(update.effective_chat.id)
+    await update.message.reply_text(
+        f"📜 *Session History* ({total} total)",
+        parse_mode="Markdown",
+        reply_markup=_kb_session_history(
+            sessions_list, session.session_id, 0, total, page_size
+        ),
     )
 
 
@@ -1364,6 +1518,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("diff", "Git diff"),
             BotCommand("commit", "Commit changes"),
             BotCommand("run", "Run shell command"),
+            BotCommand("sessions", "Browse session history"),
             BotCommand("restart", "Syntax-check & restart bot"),
             BotCommand("help", "Show help"),
         ]
@@ -1387,6 +1542,7 @@ def main() -> None:
         CommandHandler("menu", cmd_menu),
         CommandHandler("new", cmd_new),
         CommandHandler("session", cmd_session),
+        CommandHandler("sessions", cmd_sessions),
         CommandHandler("compact", cmd_compact),
         CommandHandler("clear", cmd_clear),
         CommandHandler("model", cmd_model),
