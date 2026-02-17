@@ -169,8 +169,22 @@ def discover_skills() -> list[dict]:
                 "slash": f"/{skill_name}",
             })
 
+    # Pattern 4: ~/.claude/commands/*.md (user-level Claude Code slash commands)
+    user_commands_dir = Path.home() / ".claude" / "commands"
+    if user_commands_dir.is_dir():
+        for cmd_md in sorted(user_commands_dir.glob("*.md")):
+            skill_name = cmd_md.stem
+            if skill_name in seen:
+                continue
+            seen.add(skill_name)
+            skills.append({
+                "name": skill_name,
+                "plugin": "_user-commands",
+                "slash": f"/{skill_name}",
+            })
+
     skills.sort(key=lambda s: s["name"])
-    logger.info("Discovered %d skills from %d plugins", len(skills), len(installed.get("plugins", {})))
+    logger.info("Discovered %d skills from %d plugins + user commands", len(skills), len(installed.get("plugins", {})))
     return skills
 
 
@@ -190,6 +204,7 @@ SKILL_GROUPS: dict[str, tuple[str, str]] = {
     "pr-review-toolkit":    ("📋", "PR Review"),
     "claude-md-management": ("📝", "Project Docs"),
     "code-simplifier":      ("✨", "Simplifier"),
+    "_user-commands":       ("🌐", "Browser"),
 }
 
 
@@ -1532,6 +1547,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
         .post_init(_post_init)
         .build()
     )
