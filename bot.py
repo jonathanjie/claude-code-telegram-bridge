@@ -45,7 +45,7 @@ OWNER_FILE = BOT_DIR / "owner.json"
 SESSION_FILE = BOT_DIR / "sessions.json"
 SETTINGS_FILE = BOT_DIR / "settings.json"
 RECENTS_FILE = BOT_DIR / "recents.json"
-COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "300"))  # seconds
+COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "900"))  # seconds
 STALE_TIMEOUT = int(os.environ.get("STALE_TIMEOUT", "60"))  # kill subprocess if 0 CPU for this long
 MAX_MSG_LEN = 4096
 
@@ -425,6 +425,7 @@ async def run_claude(
         proc.kill()
         return {
             "is_error": True,
+            "timed_out": True,
             "result": f"Timed out after {timeout}s",
             "session_id": session_id,
         }
@@ -668,8 +669,8 @@ async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> N
         sid = None if new_session else session.session_id
         result = await run_claude(prompt, session_id=sid)
 
-        # If --resume failed, retry without it (stale session)
-        if result.get("is_error") and sid:
+        # If --resume failed (not timeout), retry without it (stale session)
+        if result.get("is_error") and sid and not result.get("timed_out"):
             logger.warning("Session %s failed, retrying fresh", sid)
             result = await run_claude(prompt, session_id=None)
 
@@ -967,7 +968,7 @@ async def _relay_from_callback(update: Update, prompt: str, *, new_session: bool
         sid = None if new_session else session.session_id
         result = await run_claude(prompt, session_id=sid)
 
-        if result.get("is_error") and sid:
+        if result.get("is_error") and sid and not result.get("timed_out"):
             logger.warning("Session %s failed, retrying fresh", sid)
             result = await run_claude(prompt, session_id=None)
 
