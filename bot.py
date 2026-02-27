@@ -8,7 +8,9 @@ import asyncio
 import fcntl
 import logging
 import shutil
+import re
 import time
+import html as html_module
 from pathlib import Path
 from datetime import datetime
 
@@ -48,6 +50,7 @@ RECENTS_FILE = BOT_DIR / "recents.json"
 COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "900"))  # seconds
 STALE_TIMEOUT = int(os.environ.get("STALE_TIMEOUT", "60"))  # kill subprocess if 0 CPU for this long
 MAX_MSG_LEN = 4096
+PHOTO_DIR = BOT_DIR / "photos"
 
 # Claude Code session files — derive path from WORK_DIR
 _CC_SESSIONS_DIR = (
@@ -56,7 +59,7 @@ _CC_SESSIONS_DIR = (
 
 MODEL_ALIASES = {
     "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-5-20250929",
+    "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
@@ -183,6 +186,20 @@ def discover_skills() -> list[dict]:
                 "slash": f"/{skill_name}",
             })
 
+    # Pattern 5: ~/.claude/skills/*/SKILL.md (user-level custom skills)
+    user_skills_dir = Path.home() / ".claude" / "skills"
+    if user_skills_dir.is_dir():
+        for skill_md in sorted(user_skills_dir.glob("*/SKILL.md")):
+            skill_name = skill_md.parent.name
+            if skill_name in seen:
+                continue
+            seen.add(skill_name)
+            skills.append({
+                "name": skill_name,
+                "plugin": "_custom-skills",
+                "slash": f"/{skill_name}",
+            })
+
     skills.sort(key=lambda s: s["name"])
     logger.info("Discovered %d skills from %d plugins + user commands", len(skills), len(installed.get("plugins", {})))
     return skills
@@ -195,6 +212,7 @@ _skills: list[dict] = discover_skills()
 # ---------------------------------------------------------------------------
 
 SKILL_GROUPS: dict[str, tuple[str, str]] = {
+    # Dev plugins
     "superpowers":          ("💥", "Superpowers"),
     "Notion":               ("📓", "Notion"),
     "atlassian":            ("🏢", "Atlassian"),
@@ -205,7 +223,27 @@ SKILL_GROUPS: dict[str, tuple[str, str]] = {
     "claude-md-management": ("📝", "Project Docs"),
     "code-simplifier":      ("✨", "Simplifier"),
     "_user-commands":       ("🌐", "Browser"),
+    "_custom-skills":       ("🧩", "Custom"),
+    # Knowledge-work plugins
+    "legal":                    ("⚖️", "Legal"),
+    "finance":                  ("💵", "Finance"),
+    "marketing":                ("📣", "Marketing"),
+    "sales":                    ("💰", "Sales"),
+    "customer-support":         ("🎧", "Support"),
+    "product-management":       ("🗺", "Product"),
+    "data":                     ("📊", "Data"),
+    "productivity":             ("📅", "Productivity"),
+    "enterprise-search":        ("🔎", "Search"),
+    "bio-research":             ("🧬", "Bio Research"),
+    "cowork-plugin-management": ("🔌", "Plugin Mgmt"),
 }
+
+# Knowledge-work plugins in preferred display order
+_WORK_PLUGINS = [
+    "legal", "finance", "marketing", "sales", "customer-support",
+    "product-management", "data", "productivity", "enterprise-search",
+    "bio-research", "cowork-plugin-management",
+]
 
 
 def _group_label(plugin: str) -> str:
@@ -321,6 +359,7 @@ class Session:
         self.message_count = message_count
         self.busy = False
         self.pending_skill: str | None = None  # ephemeral, not persisted
+        self.queue: list[str] = []  # ephemeral — messages queued while busy
 
     def to_dict(self) -> dict:
         return {
@@ -572,6 +611,54 @@ def _format_result(data: dict) -> str:
     return "".join(parts)
 
 
+def _md_to_tg_html(text: str) -> str:
+    """Convert markdown to Telegram-compatible HTML.
+
+    Handles fenced code blocks, inline code, bold, italic, links,
+    headers, and strikethrough. Falls back gracefully on edge cases.
+    """
+    # 1. Extract fenced code blocks (protect from further processing)
+    blocks: list[str] = []
+
+    def _stash_block(m):
+        lang = m.group(1) or ""
+        code = html_module.escape(m.group(2))
+        if lang:
+            blocks.append(f'<code class="language-{lang}">{code}</code>')
+        else:
+            blocks.append(code)
+        return f"\x00CB{len(blocks) - 1}\x00"
+
+    text = re.sub(r"```(\w*)\n?(.*?)```", _stash_block, text, flags=re.DOTALL)
+
+    # 2. Extract inline code
+    inlines: list[str] = []
+
+    def _stash_inline(m):
+        inlines.append(html_module.escape(m.group(1)))
+        return f"\x00IC{len(inlines) - 1}\x00"
+
+    text = re.sub(r"`([^`\n]+)`", _stash_inline, text)
+
+    # 3. Escape HTML entities in remaining text
+    text = html_module.escape(text)
+
+    # 4. Convert markdown formatting to HTML
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+
+    # 5. Restore protected regions
+    for i, inner in enumerate(blocks):
+        text = text.replace(f"\x00CB{i}\x00", f"<pre>{inner}</pre>")
+    for i, code in enumerate(inlines):
+        text = text.replace(f"\x00IC{i}\x00", f"<code>{code}</code>")
+
+    return text
+
+
 async def _keep_typing(chat, stop: asyncio.Event) -> None:
     """Send typing action every 4s until stopped."""
     while not stop.is_set():
@@ -603,8 +690,9 @@ def _kb_main_menu(chat_id: int) -> InlineKeyboardMarkup:
         rows.append([_btn(f"⚡ {r}", f"sk:{r}") for r in recents[:3]])
 
     # Category buttons
-    rows.append([_btn("🛠 Skills", "cat:skills"), _btn("📂 Git", "cat:git")])
-    rows.append([_btn("⚙ Settings", "cat:settings"), _btn("📋 Session", "cat:session")])
+    rows.append([_btn("🛠 Skills", "cat:skills"), _btn("💼 Work", "cat:work")])
+    rows.append([_btn("📂 Git", "cat:git"), _btn("⚙ Settings", "cat:settings")])
+    rows.append([_btn("📋 Session", "cat:session")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -626,7 +714,7 @@ def _kb_skill_groups() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _kb_skill_group(plugin: str) -> InlineKeyboardMarkup:
+def _kb_skill_group(plugin: str, back_target: str = "cat:skills") -> InlineKeyboardMarkup:
     """Layer 3: show individual skills within a plugin group."""
     groups = _skills_by_group()
     skills = groups.get(plugin, [])
@@ -639,7 +727,23 @@ def _kb_skill_group(plugin: str) -> InlineKeyboardMarkup:
             pair = []
     if pair:
         rows.append(pair)
-    rows.append([_btn("« Back", "cat:skills")])
+    rows.append([_btn("« Back", back_target)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_work_groups() -> InlineKeyboardMarkup:
+    """Work skills layer 2: knowledge-work plugin categories."""
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for plugin in _WORK_PLUGINS:
+        emoji, name = SKILL_GROUPS[plugin]
+        pair.append(_btn(f"{emoji} {name}", f"wg:{plugin}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([_btn("« Back", "back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -759,47 +863,66 @@ def _auth_callback(fn):
 # ---------------------------------------------------------------------------
 
 
+async def _run_and_send(
+    chat,
+    session: Session,
+    prompt: str,
+    *,
+    new_session: bool = False,
+) -> None:
+    """Run Claude and send the formatted response to chat."""
+    sid = None if new_session else session.session_id
+    result = await run_claude(prompt, session_id=sid)
+
+    if result.get("is_error") and sid and not result.get("timed_out"):
+        logger.warning("Session %s failed, retrying fresh", sid)
+        result = await run_claude(prompt, session_id=None)
+
+    new_sid = result.get("session_id")
+    if new_sid:
+        if not session.session_id or new_session:
+            session.created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        session.session_id = new_sid
+        session.message_count += 1
+        _save_sessions()
+
+    response = _format_result(result)
+    for chunk in _split_message(response):
+        html_chunk = _md_to_tg_html(chunk)
+        try:
+            await chat.send_message(html_chunk, parse_mode="HTML")
+        except Exception:
+            await chat.send_message(chunk)
+
+
 async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> None:
-    chat_id = update.effective_chat.id
-    session = _get_session(chat_id)
+    """Send prompt to Claude Code, reply with result. Queues if busy."""
+    chat = update.effective_chat
+    session = _get_session(chat.id)
 
     if session.busy:
-        await update.message.reply_text(
-            "Claude Code is still working on the previous request. Please wait."
-        )
+        session.queue.append(prompt)
+        n = len(session.queue)
+        msg = f"Queued ({n} pending)."
+        if update.message:
+            await update.message.reply_text(msg)
+        else:
+            await chat.send_message(msg)
         return
 
     session.busy = True
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(
-        _keep_typing(update.effective_chat, stop_typing)
-    )
+    typing_task = asyncio.create_task(_keep_typing(chat, stop_typing))
 
     try:
-        sid = None if new_session else session.session_id
-        result = await run_claude(prompt, session_id=sid)
+        await _run_and_send(chat, session, prompt, new_session=new_session)
 
-        # If --resume failed (not timeout), retry without it (stale session)
-        if result.get("is_error") and sid and not result.get("timed_out"):
-            logger.warning("Session %s failed, retrying fresh", sid)
-            result = await run_claude(prompt, session_id=None)
-
-        # Update session tracking
-        new_sid = result.get("session_id")
-        if new_sid:
-            if not session.session_id or new_session:
-                session.created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-            session.session_id = new_sid
-            session.message_count += 1
-            _save_sessions()
-
-        response = _format_result(result)
-        for chunk in _split_message(response):
-            try:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
-            except Exception:
-                # Fallback: send as plain text if markdown parsing fails
-                await update.message.reply_text(chunk)
+        # Drain queue — process messages that arrived while busy
+        while session.queue:
+            queued = session.queue[:]
+            session.queue.clear()
+            combined = "\n---\n".join(queued)
+            await _run_and_send(chat, session, combined)
 
     finally:
         session.busy = False
@@ -865,13 +988,28 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         await _nav_reply(query, "🛠 *Skills*\nChoose a category.", _kb_skill_groups(), session, parse_mode="Markdown")
         return
 
+    if data == "cat:work":
+        await _nav_reply(query, "💼 *Work Skills*\nChoose a category.", _kb_work_groups(), session, parse_mode="Markdown")
+        return
+
     if data.startswith("sg:"):
         plugin = data[3:]
         label = _group_label(plugin)
         await _nav_reply(
             query,
             f"{label}\nTap to activate, then type your message.",
-            _kb_skill_group(plugin),
+            _kb_skill_group(plugin, back_target="cat:skills"),
+            session,
+        )
+        return
+
+    if data.startswith("wg:"):
+        plugin = data[3:]
+        label = _group_label(plugin)
+        await _nav_reply(
+            query,
+            f"{label}\nTap to activate, then type your message.",
+            _kb_skill_group(plugin, back_target="cat:work"),
             session,
         )
         return
@@ -988,7 +1126,7 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     # Clear any pending skill when navigating menus
-    if data not in ("cancel",) and not data.startswith("sk:") and not data.startswith("sg:"):
+    if data not in ("cancel",) and not data.startswith("sk:") and not data.startswith("sg:") and not data.startswith("wg:"):
         session.pending_skill = None
 
     # --- Skill activation (nonblocking — just sets pending state) ---
@@ -1004,12 +1142,7 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # Block destructive/relay actions if busy
-    if session.busy:
-        await update.effective_chat.send_message("Claude Code is still working on the previous request. Please wait.")
-        return
-
-    # --- Git commands ---
+    # --- Git commands (queue if busy) ---
     if data.startswith("git:"):
         action = data[4:]
         # Immediate commands (no input needed)
@@ -1020,9 +1153,8 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
             "undo": "Run `git reset --soft HEAD~1` and show result.",
         }
         if action in immediate:
-            await query.edit_message_text(f"📂 Running git {action}...")
             _record_recent(chat_id, f"git:{action}")
-            await _relay_from_callback(update, immediate[action])
+            await _relay(update, immediate[action])
             return
 
         # Commands needing input
@@ -1058,8 +1190,13 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         if action == "compact":
-            await query.edit_message_text("📦 Compacting session...")
             s = _get_session(chat_id)
+            if s.busy:
+                await update.effective_chat.send_message(
+                    "Cannot compact while a request is in progress."
+                )
+                return
+            await query.edit_message_text("📦 Compacting session...")
             if not s.session_id:
                 await query.edit_message_text("No active session to compact.", reply_markup=_kb_main_menu(chat_id))
                 return
@@ -1099,48 +1236,6 @@ async def handle_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> No
             _save_sessions()
             await _nav_reply(query, "🗑 Session cleared.", _kb_main_menu(chat_id), session)
             return
-
-
-async def _relay_from_callback(update: Update, prompt: str, *, new_session: bool = False) -> None:
-    """Like _relay but works from a callback query (no update.message)."""
-    chat_id = update.effective_chat.id
-    session = _get_session(chat_id)
-
-    if session.busy:
-        await update.effective_chat.send_message("Claude Code is still working on the previous request. Please wait.")
-        return
-
-    session.busy = True
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(_keep_typing(update.effective_chat, stop_typing))
-
-    try:
-        sid = None if new_session else session.session_id
-        result = await run_claude(prompt, session_id=sid)
-
-        if result.get("is_error") and sid and not result.get("timed_out"):
-            logger.warning("Session %s failed, retrying fresh", sid)
-            result = await run_claude(prompt, session_id=None)
-
-        new_sid = result.get("session_id")
-        if new_sid:
-            if not session.session_id or new_session:
-                session.created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-            session.session_id = new_sid
-            session.message_count += 1
-            _save_sessions()
-
-        response = _format_result(result)
-        for chunk in _split_message(response):
-            try:
-                await update.effective_chat.send_message(chunk, parse_mode="Markdown")
-            except Exception:
-                await update.effective_chat.send_message(chunk)
-
-    finally:
-        session.busy = False
-        stop_typing.set()
-        typing_task.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1342,9 @@ async def cmd_sessions(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_auth
 async def cmd_compact(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     s = _get_session(update.effective_chat.id)
+    if s.busy:
+        await update.message.reply_text("Cannot compact while a request is in progress.")
+        return
     if not s.session_id:
         await update.message.reply_text("No active session to compact.")
         return
@@ -1486,6 +1584,41 @@ async def cmd_restart(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @_auth
+async def handle_photo(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages — save image and relay to Claude Code."""
+    chat_id = update.effective_chat.id
+    session = _get_session(chat_id)
+
+    photo = update.message.photo[-1]  # largest available size
+    tg_file = await photo.get_file()
+
+    PHOTO_DIR.mkdir(exist_ok=True)
+    ext = Path(tg_file.file_path).suffix if tg_file.file_path else ".jpg"
+    path = PHOTO_DIR / f"{photo.file_unique_id}{ext}"
+    await tg_file.download_to_drive(str(path))
+
+    caption = update.message.caption or ""
+
+    if session.pending_skill:
+        skill = session.pending_skill
+        session.pending_skill = None
+        _record_recent(chat_id, skill)
+        prompt = (
+            f"/{skill} {caption}\n\n"
+            f"[User attached an image: {path} — view it with the Read tool]"
+        )
+    elif caption:
+        prompt = (
+            f"{caption}\n\n"
+            f"[User attached an image: {path} — view it with the Read tool]"
+        )
+    else:
+        prompt = f"The user sent an image. View it with the Read tool: {path}"
+
+    await _relay(update, prompt)
+
+
+@_auth
 async def handle_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     session = _get_session(chat_id)
@@ -1578,6 +1711,7 @@ def main() -> None:
         CommandHandler("run", cmd_run),
         CommandHandler("restart", cmd_restart),
         CallbackQueryHandler(handle_callback),
+        MessageHandler(filters.PHOTO, handle_photo),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
     ]
 
