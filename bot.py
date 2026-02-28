@@ -411,14 +411,14 @@ def _get_session(chat_id: int) -> Session:
 def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]:
     """Scan Claude Code session files and return recent sessions with metadata.
 
-    Reads the first user message from each JSONL (what you originally typed)
-    so sessions are recognizable. Returns (sessions, total_count).
+    Displays renamed session titles (slug) if available, otherwise falls back to
+    the first user message. Returns (sessions, total_count).
     """
     if not _CC_SESSIONS_DIR.is_dir():
         return [], 0
 
     all_files = sorted(
-        _CC_SESSIONS_DIR.glob("*.jsonl"),
+        _CC_SESSIONS_DIR.glob("*/*.jsonl"),
         key=lambda f: f.stat().st_mtime,
         reverse=True,
     )
@@ -431,13 +431,23 @@ def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]
         st = f.stat()
         mtime = datetime.fromtimestamp(st.st_mtime)
 
-        # Read first user message (the original prompt)
+        # Read renamed slug (if exists) or first user message as fallback
         prompt = ""
+        first_user_msg = ""
         try:
             with open(f) as fh:
                 for line in fh:
                     entry = json.loads(line)
-                    if entry.get("type") == "user":
+
+                    # Prefer slug (renamed session title) if present
+                    if "slug" in entry:
+                        slug = entry.get("slug", "").strip()
+                        if slug:
+                            prompt = slug
+                            break
+
+                    # Capture first user message as fallback (but keep looking for slug)
+                    if entry.get("type") == "user" and not first_user_msg:
                         msg = entry.get("message", {})
                         content = msg.get("content", "")
                         if isinstance(content, list):
@@ -446,10 +456,13 @@ def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]
                                 b.get("text", "") for b in content
                                 if isinstance(b, dict)
                             )
-                        prompt = content.strip()
-                        break
+                        first_user_msg = content.strip()
         except (json.JSONDecodeError, IOError):
             pass
+
+        # Use slug if found, otherwise use first user message
+        if not prompt:
+            prompt = first_user_msg
 
         results.append({
             "session_id": sid,
