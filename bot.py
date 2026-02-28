@@ -412,7 +412,7 @@ def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]
     """Scan Claude Code session files and return recent sessions with metadata.
 
     Displays renamed session titles (slug) if available, otherwise falls back to
-    the first user message. Returns (sessions, total_count).
+    the latest user message. Returns (sessions, total_count).
     """
     if not _CC_SESSIONS_DIR.is_dir():
         return [], 0
@@ -431,9 +431,9 @@ def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]
         st = f.stat()
         mtime = datetime.fromtimestamp(st.st_mtime)
 
-        # Read renamed slug (if exists) or first user message as fallback
+        # Read renamed slug (if exists) or latest user message as fallback
         prompt = ""
-        first_user_msg = ""
+        latest_user_msg = ""
         try:
             with open(f) as fh:
                 for line in fh:
@@ -446,8 +446,8 @@ def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]
                             prompt = slug
                             break
 
-                    # Capture first user message as fallback (but keep looking for slug)
-                    if entry.get("type") == "user" and not first_user_msg:
+                    # Capture latest user message as fallback (keep updating to get the newest)
+                    if entry.get("type") == "user":
                         msg = entry.get("message", {})
                         content = msg.get("content", "")
                         if isinstance(content, list):
@@ -456,13 +456,13 @@ def _scan_cc_sessions(limit: int = 8, offset: int = 0) -> tuple[list[dict], int]
                                 b.get("text", "") for b in content
                                 if isinstance(b, dict)
                             )
-                        first_user_msg = content.strip()
+                        latest_user_msg = content.strip()
         except (json.JSONDecodeError, IOError):
             pass
 
-        # Use slug if found, otherwise use first user message
+        # Use slug if found, otherwise use latest user message
         if not prompt:
-            prompt = first_user_msg
+            prompt = latest_user_msg
 
         results.append({
             "session_id": sid,
