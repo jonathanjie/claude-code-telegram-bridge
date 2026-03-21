@@ -601,6 +601,94 @@ async def run_claude(
         return {"result": raw.strip(), "session_id": session_id}
 
 
+async def run_claude_streaming(
+    prompt: str,
+    session_id: str | None = None,
+    timeout: int = COMMAND_TIMEOUT,
+    work_dir: str | None = None,
+    claude_bin: str | None = None,
+    on_text=None,
+) -> dict:
+    """Run claude -p with stream-json and call on_text(text) as content arrives.
+
+    Uses create_subprocess_exec (arg-list form, no shell) for safety.
+    Falls back to non-streaming run_claude if the stream fails to produce events.
+    """
+    _bin = claude_bin or CLAUDE_BIN
+    _dir = work_dir or WORK_DIR
+
+    cmd = [_bin, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    if model := _settings.get("model"):
+        cmd += ["--model", model]
+    if _settings.get("skip_permissions") == "1":
+        cmd.append("--dangerously-skip-permissions")
+
+    logger.info("Running (stream): %s (cwd=%s)", " ".join(cmd[:8]), _dir)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=_dir,
+        env=_claude_env(),
+    )
+
+    watchdog = asyncio.create_task(_cpu_watchdog(proc, STALE_TIMEOUT))
+    result_data: dict = {}
+    accumulated_text = ""
+
+    try:
+        async def _read_stream():
+            nonlocal accumulated_text, result_data
+            async for raw_line in proc.stdout:
+                line = raw_line.decode().strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type")
+                if etype == "assistant":
+                    msg = event.get("message", {})
+                    for block in msg.get("content", []):
+                        if block.get("type") == "text":
+                            accumulated_text = block.get("text", "")
+                            if on_text and accumulated_text:
+                                await on_text(accumulated_text)
+                elif etype == "result":
+                    result_data = {
+                        "result": event.get("result", accumulated_text),
+                        "session_id": event.get("session_id"),
+                        "is_error": event.get("is_error", False),
+                        "cost_usd": event.get("total_cost_usd"),
+                        "num_turns": event.get("num_turns"),
+                        "duration_ms": event.get("duration_ms"),
+                    }
+
+        await asyncio.wait_for(_read_stream(), timeout=timeout)
+        await proc.wait()
+
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {
+            "is_error": True,
+            "timed_out": True,
+            "result": f"Timed out after {timeout}s",
+            "session_id": session_id,
+        }
+    finally:
+        watchdog.cancel()
+
+    if not result_data:
+        result_data = {"result": accumulated_text, "session_id": session_id}
+
+    return result_data
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -939,20 +1027,47 @@ async def _run_and_send(
     placeholder=None,
     vps_override: dict | None = None,
 ) -> None:
-    """Run Claude and send the formatted response to chat.
+    """Run Claude with streaming and progressively update the placeholder.
 
-    If *placeholder* is given, edit it with the first response chunk
-    instead of sending a new message.  *vps_override* changes the
-    working directory and/or claude binary for this invocation.
+    Uses stream-json to show partial content as it arrives (rate-limited
+    to one edit every 3s to avoid Telegram API throttling).  Falls back
+    to non-streaming run_claude if streaming produces no events.
+    *vps_override* changes the working directory and/or claude binary.
     """
     sid = None if new_session else session.session_id
     _wd = vps_override.get("work_dir") if vps_override else None
     _cb = vps_override.get("claude_bin") if vps_override else None
-    result = await run_claude(prompt, session_id=sid, work_dir=_wd, claude_bin=_cb)
+
+    last_edit = [0.0]
+    last_text = [""]
+
+    async def _on_text(text: str):
+        now = time.monotonic()
+        if now - last_edit[0] < 3.0:
+            return
+        if text == last_text[0]:
+            return
+        last_edit[0] = now
+        last_text[0] = text
+        if placeholder:
+            preview = text[:MAX_MSG_LEN - 30]
+            if len(text) > MAX_MSG_LEN - 30:
+                preview += "\n\n\u2026 streaming"
+            try:
+                await placeholder.edit_text(preview)
+            except Exception:
+                pass
+
+    result = await run_claude_streaming(
+        prompt, session_id=sid, work_dir=_wd, claude_bin=_cb,
+        on_text=_on_text,
+    )
 
     if result.get("is_error") and sid and not result.get("timed_out"):
         logger.warning("Session %s failed, retrying fresh", sid)
-        result = await run_claude(prompt, session_id=None, work_dir=_wd, claude_bin=_cb)
+        result = await run_claude_streaming(
+            prompt, session_id=None, work_dir=_wd, claude_bin=_cb,
+        )
 
     new_sid = result.get("session_id")
     if new_sid:
