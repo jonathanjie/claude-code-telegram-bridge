@@ -909,8 +909,13 @@ async def _run_and_send(
     prompt: str,
     *,
     new_session: bool = False,
+    placeholder=None,
 ) -> None:
-    """Run Claude and send the formatted response to chat."""
+    """Run Claude and send the formatted response to chat.
+
+    If *placeholder* is given, edit it with the first response chunk
+    instead of sending a new message.
+    """
     sid = None if new_session else session.session_id
     result = await run_claude(prompt, session_id=sid)
 
@@ -928,13 +933,33 @@ async def _run_and_send(
 
     response = _format_result(result)
     response, attachments = _extract_file_paths(response)
+    chunks = _split_message(response)
 
-    for chunk in _split_message(response):
-        html_chunk = _md_to_tg_html(chunk)
+    # Edit the placeholder with the first chunk, send the rest as new messages
+    if placeholder and chunks:
+        first = chunks[0]
+        html_first = _md_to_tg_html(first)
         try:
-            await chat.send_message(html_chunk, parse_mode="HTML")
+            await placeholder.edit_text(html_first, parse_mode="HTML")
         except Exception:
-            await chat.send_message(chunk)
+            try:
+                await placeholder.edit_text(first)
+            except Exception:
+                await chat.send_message(first)
+
+        for chunk in chunks[1:]:
+            html_chunk = _md_to_tg_html(chunk)
+            try:
+                await chat.send_message(html_chunk, parse_mode="HTML")
+            except Exception:
+                await chat.send_message(chunk)
+    else:
+        for chunk in (chunks or []):
+            html_chunk = _md_to_tg_html(chunk)
+            try:
+                await chat.send_message(html_chunk, parse_mode="HTML")
+            except Exception:
+                await chat.send_message(chunk)
 
     # Send extracted file attachments
     for fpath in attachments:
@@ -964,23 +989,26 @@ async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> N
         return
 
     session.busy = True
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(_keep_typing(chat, stop_typing))
+
+    # Send a placeholder that gets edited with the result
+    placeholder = await chat.send_message("Working...")
 
     try:
-        await _run_and_send(chat, session, prompt, new_session=new_session)
+        await _run_and_send(
+            chat, session, prompt,
+            new_session=new_session, placeholder=placeholder,
+        )
 
         # Drain queue — process messages that arrived while busy
         while session.queue:
             queued = session.queue[:]
             session.queue.clear()
             combined = "\n---\n".join(queued)
-            await _run_and_send(chat, session, combined)
+            ph = await chat.send_message("Working...")
+            await _run_and_send(chat, session, combined, placeholder=ph)
 
     finally:
         session.busy = False
-        stop_typing.set()
-        typing_task.cancel()
 
 
 # ---------------------------------------------------------------------------
