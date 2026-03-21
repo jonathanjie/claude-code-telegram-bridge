@@ -223,6 +223,11 @@ SKILL_GROUPS: dict[str, tuple[str, str]] = {
     "pr-review-toolkit":    ("📋", "PR Review"),
     "claude-md-management": ("📝", "Project Docs"),
     "code-simplifier":      ("✨", "Simplifier"),
+    "security-guidance":    ("🔒", "Security"),
+    "github":               ("🐙", "GitHub"),
+    "greptile":             ("🔎", "Greptile"),
+    "typescript-lsp":       ("📐", "TS LSP"),
+    "explanatory-output-style": ("📖", "Output Style"),
     "_user-commands":       ("🌐", "Browser"),
     "_custom-skills":       ("🧩", "Custom"),
     # Knowledge-work plugins
@@ -237,6 +242,17 @@ SKILL_GROUPS: dict[str, tuple[str, str]] = {
     "enterprise-search":        ("🔎", "Search"),
     "bio-research":             ("🧬", "Bio Research"),
     "cowork-plugin-management": ("🔌", "Plugin Mgmt"),
+    # Partner plugins
+    "slack-by-salesforce":      ("💬", "Slack"),
+    "apollo":                   ("🚀", "Apollo"),
+    "common-room":              ("🏘", "Common Room"),
+    "brand-voice":              ("🎙", "Brand Voice"),
+    # Additional knowledge-work
+    "engineering":              ("⚙️", "Engineering"),
+    "human-resources":          ("👥", "HR"),
+    "design":                   ("🖌", "Design"),
+    "operations":               ("🏭", "Operations"),
+    "telegram":                 ("📱", "Telegram"),
 }
 
 # Knowledge-work plugins in preferred display order
@@ -244,6 +260,8 @@ _WORK_PLUGINS = [
     "legal", "finance", "marketing", "sales", "customer-support",
     "product-management", "data", "productivity", "enterprise-search",
     "bio-research", "cowork-plugin-management",
+    "engineering", "human-resources", "design", "operations",
+    "slack-by-salesforce", "apollo", "common-room", "brand-voice",
 ]
 
 
