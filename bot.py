@@ -51,6 +51,7 @@ COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "900"))  # seconds
 STALE_TIMEOUT = int(os.environ.get("STALE_TIMEOUT", "60"))  # kill subprocess if 0 CPU for this long
 MAX_MSG_LEN = 4096
 PHOTO_DIR = BOT_DIR / "photos"
+VPS_ROUTES_FILE = BOT_DIR / "vps_routes.json"
 
 # Claude Code session files — derive path from WORK_DIR
 _CC_SESSIONS_DIR = (
@@ -343,6 +344,26 @@ def _record_recent(chat_id: int, name: str) -> None:
 _load_recents()
 
 # ---------------------------------------------------------------------------
+# VPS routing — name -> work_dir mapping
+# ---------------------------------------------------------------------------
+
+_vps_routes: dict[str, dict] = {}
+
+
+def _load_vps_routes() -> None:
+    global _vps_routes
+    if VPS_ROUTES_FILE.exists():
+        _vps_routes = json.loads(VPS_ROUTES_FILE.read_text())
+    logger.info("Loaded %d VPS route(s)", len(_vps_routes))
+
+
+def _save_vps_routes() -> None:
+    VPS_ROUTES_FILE.write_text(json.dumps(_vps_routes, indent=2))
+
+
+_load_vps_routes()
+
+# ---------------------------------------------------------------------------
 # Session persistence
 # ---------------------------------------------------------------------------
 
@@ -521,13 +542,19 @@ async def run_claude(
     prompt: str,
     session_id: str | None = None,
     timeout: int = COMMAND_TIMEOUT,
+    work_dir: str | None = None,
+    claude_bin: str | None = None,
 ) -> dict:
     """Run ``claude -p`` and return parsed JSON result.
 
     Uses create_subprocess_exec (arg-list form, no shell) for safety.
+    *work_dir* and *claude_bin* override the global defaults when set
+    (used by VPS routing).
     """
+    _bin = claude_bin or CLAUDE_BIN
+    _dir = work_dir or WORK_DIR
 
-    cmd = [CLAUDE_BIN, "-p", prompt, "--output-format", "json"]
+    cmd = [_bin, "-p", prompt, "--output-format", "json"]
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -537,13 +564,13 @@ async def run_claude(
     if _settings.get("skip_permissions") == "1":
         cmd.append("--dangerously-skip-permissions")
 
-    logger.info("Running: %s", " ".join(cmd))
+    logger.info("Running: %s (cwd=%s)", " ".join(cmd), _dir)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=WORK_DIR,
+        cwd=_dir,
         env=_claude_env(),
     )
 
@@ -572,6 +599,94 @@ async def run_claude(
         return json.loads(raw)
     except json.JSONDecodeError:
         return {"result": raw.strip(), "session_id": session_id}
+
+
+async def run_claude_streaming(
+    prompt: str,
+    session_id: str | None = None,
+    timeout: int = COMMAND_TIMEOUT,
+    work_dir: str | None = None,
+    claude_bin: str | None = None,
+    on_text=None,
+) -> dict:
+    """Run claude -p with stream-json and call on_text(text) as content arrives.
+
+    Uses create_subprocess_exec (arg-list form, no shell) for safety.
+    Falls back to non-streaming run_claude if the stream fails to produce events.
+    """
+    _bin = claude_bin or CLAUDE_BIN
+    _dir = work_dir or WORK_DIR
+
+    cmd = [_bin, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    if model := _settings.get("model"):
+        cmd += ["--model", model]
+    if _settings.get("skip_permissions") == "1":
+        cmd.append("--dangerously-skip-permissions")
+
+    logger.info("Running (stream): %s (cwd=%s)", " ".join(cmd[:8]), _dir)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=_dir,
+        env=_claude_env(),
+    )
+
+    watchdog = asyncio.create_task(_cpu_watchdog(proc, STALE_TIMEOUT))
+    result_data: dict = {}
+    accumulated_text = ""
+
+    try:
+        async def _read_stream():
+            nonlocal accumulated_text, result_data
+            async for raw_line in proc.stdout:
+                line = raw_line.decode().strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type")
+                if etype == "assistant":
+                    msg = event.get("message", {})
+                    for block in msg.get("content", []):
+                        if block.get("type") == "text":
+                            accumulated_text = block.get("text", "")
+                            if on_text and accumulated_text:
+                                await on_text(accumulated_text)
+                elif etype == "result":
+                    result_data = {
+                        "result": event.get("result", accumulated_text),
+                        "session_id": event.get("session_id"),
+                        "is_error": event.get("is_error", False),
+                        "cost_usd": event.get("total_cost_usd"),
+                        "num_turns": event.get("num_turns"),
+                        "duration_ms": event.get("duration_ms"),
+                    }
+
+        await asyncio.wait_for(_read_stream(), timeout=timeout)
+        await proc.wait()
+
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {
+            "is_error": True,
+            "timed_out": True,
+            "result": f"Timed out after {timeout}s",
+            "session_id": session_id,
+        }
+    finally:
+        watchdog.cancel()
+
+    if not result_data:
+        result_data = {"result": accumulated_text, "session_id": session_id}
+
+    return result_data
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +737,33 @@ def _format_result(data: dict) -> str:
         parts.append(f"\n[{' | '.join(meta)}]")
 
     return "".join(parts)
+
+
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+def _extract_file_paths(text: str) -> tuple[str, list[Path]]:
+    """Extract existing file paths from Claude's response for attachment.
+
+    Returns (original_text, list_of_paths). Paths must be absolute,
+    exist on disk, and be under 50MB (Telegram limit).
+    """
+    files: list[Path] = []
+    seen: set[str] = set()
+    for m in re.finditer(
+        r'`(/[^\s`]+)`|(?<!\w)(/(?:home|tmp|var|data)[^\s,)}\]]+)', text
+    ):
+        path_str = m.group(1) or m.group(2)
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+        p = Path(path_str)
+        try:
+            if p.is_file() and p.stat().st_size < 50 * 1024 * 1024:
+                files.append(p)
+        except OSError:
+            pass
+    return text, files
 
 
 def _md_to_tg_html(text: str) -> str:
@@ -882,14 +1024,50 @@ async def _run_and_send(
     prompt: str,
     *,
     new_session: bool = False,
+    placeholder=None,
+    vps_override: dict | None = None,
 ) -> None:
-    """Run Claude and send the formatted response to chat."""
+    """Run Claude with streaming and progressively update the placeholder.
+
+    Uses stream-json to show partial content as it arrives (rate-limited
+    to one edit every 3s to avoid Telegram API throttling).  Falls back
+    to non-streaming run_claude if streaming produces no events.
+    *vps_override* changes the working directory and/or claude binary.
+    """
     sid = None if new_session else session.session_id
-    result = await run_claude(prompt, session_id=sid)
+    _wd = vps_override.get("work_dir") if vps_override else None
+    _cb = vps_override.get("claude_bin") if vps_override else None
+
+    last_edit = [0.0]
+    last_text = [""]
+
+    async def _on_text(text: str):
+        now = time.monotonic()
+        if now - last_edit[0] < 3.0:
+            return
+        if text == last_text[0]:
+            return
+        last_edit[0] = now
+        last_text[0] = text
+        if placeholder:
+            preview = text[:MAX_MSG_LEN - 30]
+            if len(text) > MAX_MSG_LEN - 30:
+                preview += "\n\n\u2026 streaming"
+            try:
+                await placeholder.edit_text(preview)
+            except Exception:
+                pass
+
+    result = await run_claude_streaming(
+        prompt, session_id=sid, work_dir=_wd, claude_bin=_cb,
+        on_text=_on_text,
+    )
 
     if result.get("is_error") and sid and not result.get("timed_out"):
         logger.warning("Session %s failed, retrying fresh", sid)
-        result = await run_claude(prompt, session_id=None)
+        result = await run_claude_streaming(
+            prompt, session_id=None, work_dir=_wd, claude_bin=_cb,
+        )
 
     new_sid = result.get("session_id")
     if new_sid:
@@ -900,15 +1078,54 @@ async def _run_and_send(
         _save_sessions()
 
     response = _format_result(result)
-    for chunk in _split_message(response):
-        html_chunk = _md_to_tg_html(chunk)
+    response, attachments = _extract_file_paths(response)
+    chunks = _split_message(response)
+
+    # Edit the placeholder with the first chunk, send the rest as new messages
+    if placeholder and chunks:
+        first = chunks[0]
+        html_first = _md_to_tg_html(first)
         try:
-            await chat.send_message(html_chunk, parse_mode="HTML")
+            await placeholder.edit_text(html_first, parse_mode="HTML")
         except Exception:
-            await chat.send_message(chunk)
+            try:
+                await placeholder.edit_text(first)
+            except Exception:
+                await chat.send_message(first)
+
+        for chunk in chunks[1:]:
+            html_chunk = _md_to_tg_html(chunk)
+            try:
+                await chat.send_message(html_chunk, parse_mode="HTML")
+            except Exception:
+                await chat.send_message(chunk)
+    else:
+        for chunk in (chunks or []):
+            html_chunk = _md_to_tg_html(chunk)
+            try:
+                await chat.send_message(html_chunk, parse_mode="HTML")
+            except Exception:
+                await chat.send_message(chunk)
+
+    # Send extracted file attachments
+    for fpath in attachments:
+        try:
+            with open(fpath, "rb") as f:
+                if fpath.suffix.lower() in _IMAGE_EXTS:
+                    await chat.send_photo(photo=f, caption=fpath.name)
+                else:
+                    await chat.send_document(document=f, caption=fpath.name)
+        except Exception as e:
+            logger.warning("Failed to send file %s: %s", fpath, e)
 
 
-async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> None:
+async def _relay(
+    update: Update,
+    prompt: str,
+    *,
+    new_session: bool = False,
+    vps_override: dict | None = None,
+) -> None:
     """Send prompt to Claude Code, reply with result. Queues if busy."""
     chat = update.effective_chat
     session = _get_session(chat.id)
@@ -924,23 +1141,35 @@ async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> N
         return
 
     session.busy = True
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(_keep_typing(chat, stop_typing))
+
+    # Send a placeholder that gets edited with the result
+    # Show which VPS route is being used in the placeholder
+    vps_name = ""
+    if vps_override:
+        for name, cfg in _vps_routes.items():
+            if cfg is vps_override:
+                vps_name = f" [{name}]"
+                break
+    placeholder = await chat.send_message(f"Working...{vps_name}")
 
     try:
-        await _run_and_send(chat, session, prompt, new_session=new_session)
+        await _run_and_send(
+            chat, session, prompt,
+            new_session=new_session, placeholder=placeholder,
+            vps_override=vps_override,
+        )
 
         # Drain queue — process messages that arrived while busy
         while session.queue:
             queued = session.queue[:]
             session.queue.clear()
             combined = "\n---\n".join(queued)
-            await _run_and_send(chat, session, combined)
+            ph = await chat.send_message("Working...")
+            await _run_and_send(chat, session, combined, placeholder=ph,
+                                vps_override=vps_override)
 
     finally:
         session.busy = False
-        stop_typing.set()
-        typing_task.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -1593,6 +1822,54 @@ async def cmd_restart(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# --- VPS routing ---
+
+
+@_auth
+async def cmd_vps(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manage VPS routing: /vps add <name> <work_dir> | /vps remove <name> | /vps"""
+    if not ctx.args:
+        if not _vps_routes:
+            await update.message.reply_text(
+                "No VPS routes configured.\n\n"
+                "Usage:\n/vps add <name> <work_dir>\n/vps remove <name>"
+            )
+            return
+        lines = [f"/{name} \u2192 {cfg.get('work_dir', '?')}" for name, cfg in _vps_routes.items()]
+        await update.message.reply_text("VPS Routes:\n" + "\n".join(lines))
+        return
+
+    action = ctx.args[0].lower()
+    if action == "add" and len(ctx.args) >= 3:
+        name = ctx.args[1].lower()
+        work_dir = ctx.args[2]
+        _vps_routes[name] = {"work_dir": work_dir}
+        _save_vps_routes()
+        await update.message.reply_text(f"Added: /{name} \u2192 {work_dir}")
+    elif action == "remove" and len(ctx.args) >= 2:
+        name = ctx.args[1].lower()
+        if name in _vps_routes:
+            del _vps_routes[name]
+            _save_vps_routes()
+            await update.message.reply_text(f"Removed: /{name}")
+        else:
+            await update.message.reply_text(f"Route '{name}' not found.")
+    elif action == "rename" and len(ctx.args) >= 3:
+        old_name = ctx.args[1].lower()
+        new_name = ctx.args[2].lower()
+        if old_name in _vps_routes:
+            _vps_routes[new_name] = _vps_routes.pop(old_name)
+            _save_vps_routes()
+            await update.message.reply_text(f"Renamed: /{old_name} \u2192 /{new_name}")
+        else:
+            await update.message.reply_text(f"Route '{old_name}' not found.")
+    else:
+        await update.message.reply_text(
+            "Usage:\n/vps add <name> <work_dir>\n/vps remove <name>\n"
+            "/vps rename <old> <new>\n/vps (list)"
+        )
+
+
 # --- Regular messages ---
 
 
@@ -1660,6 +1937,14 @@ async def handle_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await _relay(update, f"/{skill} {text}")
         return
 
+    # VPS routing: check for prefix like "/fleet ..." or "/hadrian ..."
+    if text.startswith("/") and " " in text:
+        prefix = text.split(" ", 1)[0][1:].lower()
+        if prefix in _vps_routes:
+            text = text.split(" ", 1)[1]
+            await _relay(update, text, vps_override=_vps_routes[prefix])
+            return
+
     await _relay(update, text)
 
 
@@ -1681,6 +1966,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("run", "Run shell command"),
             BotCommand("sessions", "Browse session history"),
             BotCommand("restart", "Syntax-check & restart bot"),
+            BotCommand("vps", "Manage VPS routing"),
             BotCommand("help", "Show help"),
         ]
     )
@@ -1723,6 +2009,7 @@ def main() -> None:
         CommandHandler("edit", cmd_edit),
         CommandHandler("run", cmd_run),
         CommandHandler("restart", cmd_restart),
+        CommandHandler("vps", cmd_vps),
         CallbackQueryHandler(handle_callback),
         MessageHandler(filters.PHOTO, handle_photo),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
