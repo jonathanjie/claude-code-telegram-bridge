@@ -624,6 +624,33 @@ def _format_result(data: dict) -> str:
     return "".join(parts)
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+def _extract_file_paths(text: str) -> tuple[str, list[Path]]:
+    """Extract existing file paths from Claude's response for attachment.
+
+    Returns (original_text, list_of_paths). Paths must be absolute,
+    exist on disk, and be under 50MB (Telegram limit).
+    """
+    files: list[Path] = []
+    seen: set[str] = set()
+    for m in re.finditer(
+        r'`(/[^\s`]+)`|(?<!\w)(/(?:home|tmp|var|data)[^\s,)}\]]+)', text
+    ):
+        path_str = m.group(1) or m.group(2)
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+        p = Path(path_str)
+        try:
+            if p.is_file() and p.stat().st_size < 50 * 1024 * 1024:
+                files.append(p)
+        except OSError:
+            pass
+    return text, files
+
+
 def _md_to_tg_html(text: str) -> str:
     """Convert markdown to Telegram-compatible HTML.
 
@@ -900,12 +927,25 @@ async def _run_and_send(
         _save_sessions()
 
     response = _format_result(result)
+    response, attachments = _extract_file_paths(response)
+
     for chunk in _split_message(response):
         html_chunk = _md_to_tg_html(chunk)
         try:
             await chat.send_message(html_chunk, parse_mode="HTML")
         except Exception:
             await chat.send_message(chunk)
+
+    # Send extracted file attachments
+    for fpath in attachments:
+        try:
+            with open(fpath, "rb") as f:
+                if fpath.suffix.lower() in _IMAGE_EXTS:
+                    await chat.send_photo(photo=f, caption=fpath.name)
+                else:
+                    await chat.send_document(document=f, caption=fpath.name)
+        except Exception as e:
+            logger.warning("Failed to send file %s: %s", fpath, e)
 
 
 async def _relay(update: Update, prompt: str, *, new_session: bool = False) -> None:
